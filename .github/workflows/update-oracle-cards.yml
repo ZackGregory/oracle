@@ -35,7 +35,6 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
-
       - name: Ask Scryfall which oracle_cards file is current
         id: index
         run: |
@@ -46,9 +45,23 @@ jobs:
 
           # -e makes jq exit non-zero if the oracle_cards entry is missing.
           jq -e '.data[] | select(.type == "oracle_cards")' bulk-index.json > entry.json
+
+          updated_at=$(jq -r '.updated_at' entry.json)
+          download_uri=$(jq -r '.download_uri' entry.json)
+
+          if [ -z "$updated_at" ] || [ "$updated_at" = "null" ]; then
+            echo "ERROR: updated_at is missing or null from Scryfall response" >&2
+            exit 1
+          fi
+
+          if [ -z "$download_uri" ] || [ "$download_uri" = "null" ]; then
+            echo "ERROR: download_uri is missing or null from Scryfall response" >&2
+            exit 1
+          fi
+
           {
-            echo "updated_at=$(jq -r .updated_at entry.json)"
-            echo "download_uri=$(jq -r .download_uri entry.json)"
+            echo "updated_at=$updated_at"
+            echo "download_uri=$download_uri"
           } >> "$GITHUB_OUTPUT"
 
       - name: Skip if the published build is already this one
