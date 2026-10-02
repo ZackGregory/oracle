@@ -1,0 +1,152 @@
+name: Update Scryfall oracle cards
+
+on:
+  schedule:
+    # Once a day at 12:37 UTC. Scryfall regenerates its bulk files daily; the
+    # odd minute keeps this off the top-of-the-hour queue, which GitHub delays
+    # the most. If you notice Scryfall's updated_at usually lands later than
+    # this, move the hour.
+    - cron: "37 12 * * *"
+  workflow_dispatch: # also lets you run it by hand from the Actions tab
+
+# The job needs to push a commit and upload a release asset.
+permissions:
+  contents: write
+
+# Never let a manual run and a scheduled run push at the same time.
+concurrency:
+  group: refresh-oracle-cards
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: oracle-cards
+  ASSET_NAME: oracle-cards.jsonl.gz
+  META_FILE: oracle-cards.meta.json
+  # Scryfall asks every client to identify itself and may reject requests that don't.
+  SCRYFALL_UA: "github.com/${{ github.repository }} (oracle-cards refresh workflow)"
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash # explicit "bash" gives -e and -o pipefail, so a failing pipe fails the step
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Ask Scryfall which oracle_cards file is current
+        id: index
+        run: |
+          curl --silent --show-error --fail --retry 3 \
+            -H "User-Agent: $SCRYFALL_UA" \
+            -H "Accept: application/json" \
+            https://api.scryfall.com/bulk-data > bulk-index.json
+
+          # -e makes jq exit non-zero if the oracle_cards entry is missing.
+          jq -e '.data[] | select(.type == "oracle_cards")' bulk-index.json > entry.json
+          {
+            echo "updated_at=$(jq -r .updated_at entry.json)"
+            echo "download_uri=$(jq -r .download_uri entry.json)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Skip if the published build is already this one
+        id: check
+        env:
+          UPDATED_AT: ${{ steps.index.outputs.updated_at }}
+        run: |
+          previous=$(jq -r '.scryfall_updated_at // empty' "$META_FILE" 2>/dev/null || true)
+          if [ "$previous" = "$UPDATED_AT" ]; then
+            echo "Already published Scryfall build $UPDATED_AT - nothing to do."
+            echo "fresh=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "New Scryfall build: $UPDATED_AT (had: ${previous:-none})"
+            echo "fresh=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download and convert to gzipped JSONL
+        id: convert
+        if: steps.check.outputs.fresh == 'true'
+        env:
+          DOWNLOAD_URI: ${{ steps.index.outputs.download_uri }}
+        run: |
+          # --compressed: Scryfall serves the file gzip-encoded; this makes curl
+          # ask for that and decode it, so what lands on disk is plain JSON.
+          curl --silent --show-error --fail --location --retry 3 --compressed \
+            -H "User-Agent: $SCRYFALL_UA" \
+            -H "Accept: application/json" \
+            -o oracle-cards.json \
+            "$DOWNLOAD_URI"
+
+          # One compact card object per line. jq holds the whole ~200 MB array
+          # in memory for this; a hosted runner has plenty.
+          jq -c '.[]' oracle-cards.json > oracle-cards.jsonl
+
+          # Sanity checks before anything is published: it must look like a
+          # long list of card objects, not an error page or a truncated download.
+          count=$(wc -l < oracle-cards.jsonl)
+          head -n 1 oracle-cards.jsonl | jq -e '.object == "card"' > /dev/null
+          test "$count" -ge 10000
+
+          # -n leaves the timestamp out of the gzip header, so the archive's
+          # checksum depends only on its contents.
+          gzip -9 -n -c oracle-cards.jsonl > "$ASSET_NAME"
+
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "Converted $count cards -> $ASSET_NAME ($(du -h "$ASSET_NAME" | cut -f1))"
+
+      - name: Write metadata
+        if: steps.check.outputs.fresh == 'true'
+        env:
+          UPDATED_AT: ${{ steps.index.outputs.updated_at }}
+          COUNT: ${{ steps.convert.outputs.count }}
+        run: |
+          jq -n \
+            --arg updated_at "$UPDATED_AT" \
+            --arg fetched_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --argjson count "$COUNT" \
+            --arg asset "$ASSET_NAME" \
+            --arg url "https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/$ASSET_NAME" \
+            --arg sha256 "$(sha256sum "$ASSET_NAME" | cut -d ' ' -f 1)" \
+            '{
+              scryfall_updated_at: $updated_at,
+              fetched_at: $fetched_at,
+              card_count: $count,
+              asset: $asset,
+              download_url: $url,
+              sha256: $sha256
+            }' > "$META_FILE"
+          cat "$META_FILE"
+
+      - name: Publish to the rolling release
+        if: steps.check.outputs.fresh == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          UPDATED_AT: ${{ steps.index.outputs.updated_at }}
+          COUNT: ${{ steps.convert.outputs.count }}
+        run: |
+          notes="Scryfall oracle_cards build $UPDATED_AT, $COUNT cards, converted to gzipped JSONL (one card object per line). Checksum and details in $META_FILE."
+          if gh release view "$RELEASE_TAG" > /dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" --notes "$notes"
+          else
+            gh release create "$RELEASE_TAG" --title "Scryfall oracle cards (rolling)" --notes "$notes"
+          fi
+          # --clobber replaces the existing assets of the same names, so the
+          # download URLs never change.
+          gh release upload "$RELEASE_TAG" "$ASSET_NAME" "$META_FILE" --clobber
+
+      - name: Commit the metadata
+        if: steps.check.outputs.fresh == 'true'
+        env:
+          UPDATED_AT: ${{ steps.index.outputs.updated_at }}
+        run: |
+          # Besides giving the repo a visible history of data builds, this tiny
+          # daily commit counts as repository activity, which stops GitHub from
+          # auto-disabling the schedule after 60 days of inactivity.
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$META_FILE"
+          git commit -m "oracle cards: Scryfall build $UPDATED_AT"
+          git push
