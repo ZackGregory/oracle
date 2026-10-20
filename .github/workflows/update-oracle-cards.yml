@@ -104,15 +104,23 @@ jobs:
           # The Python below is indented to match this run block. YAML strips
           # that shared indentation, so Python still sees top-level code.
           pdf_url=$(python3 - <<'PY' || true
+          import html
           import re
           import pathlib
-          from urllib.parse import urljoin
+          from urllib.parse import quote, urljoin
 
           page = pathlib.Path("rules.html").read_text(encoding="utf-8", errors="replace")
           base = "https://magic.wizards.com/en/rules"
 
+          def clean(url):
+              # Hrefs can contain HTML entities (&amp;) and raw spaces, which
+              # curl rejects. Percent-encode anything unsafe, but leave
+              # existing %XX escapes and URL punctuation alone.
+              url = urljoin(base, html.unescape(url).strip())
+              return quote(url, safe=":/?#[]@!$&'()*+,;=%~")
+
           matches = re.findall(r'''(?i)(?:href|src)=["']([^"']+?\.pdf(?:\?[^"']*)?)["']''', page)
-          candidates = [urljoin(base, m) for m in matches]
+          candidates = [clean(m) for m in matches]
 
           for item in candidates:
               if re.search(r"magiccomp|magic.*comp.*rules|comp.*rules", item, re.I):
