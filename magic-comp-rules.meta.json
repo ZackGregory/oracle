@@ -1,9 +1,17 @@
 {
-  "pdf_url": "https://media.wizards.com/2026/downloads/MagicCompRules%2020260925.pdf",
+  "edition_date": "2026-09-25",
+  "edition_date_source": "txt",
+  "filename_date": "2026-09-25",
   "source_page": "https://magic.wizards.com/en/rules",
-  "fetched_at": "2026-10-20T23:03:06Z",
+  "fetched_at": "2026-10-20T23:13:00Z",
+  "pdf_url": "https://media.wizards.com/2026/downloads/MagicCompRules%2020260925.pdf",
   "asset": "magic-comp-rules.pdf",
   "bytes": 2527259,
   "download_url": "https://github.com/ZackGregory/oracle/releases/download/magic-comp-rules/magic-comp-rules.pdf",
-  "sha256": "674241213075cd581dd3255567ebeec7b40ffae3a27c6a3bd99218af6b2b6659"
+  "sha256": "674241213075cd581dd3255567ebeec7b40ffae3a27c6a3bd99218af6b2b6659",
+  "txt_url": "https://media.wizards.com/2026/downloads/MagicCompRules%2020260925.txt",
+  "txt_asset": "magic-comp-rules.txt",
+  "txt_bytes": 977752,
+  "txt_download_url": "https://github.com/ZackGregory/oracle/releases/download/magic-comp-rules/magic-comp-rules.txt",
+  "txt_sha256": "8d860e451f20f38865b725b42d82feb714c725373dd8f3b32b8652b3eeb070ca"
 }
