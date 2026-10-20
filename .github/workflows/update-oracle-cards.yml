@@ -24,6 +24,7 @@ env:
   ORACLE_META_FILE: oracle-cards.meta.json
   RULES_RELEASE_TAG: magic-comp-rules
   RULES_ASSET_NAME: magic-comp-rules.pdf
+  RULES_TXT_ASSET_NAME: magic-comp-rules.txt
   RULES_META_FILE: magic-comp-rules.meta.json
   RULES_PAGE_URL: https://magic.wizards.com/en/rules
   # Scryfall rejects API requests that don't identify themselves.
@@ -93,7 +94,7 @@ jobs:
             echo "fresh=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Discover the current Magic Comp Rules PDF URL
+      - name: Discover the current Magic Comp Rules PDF and TXT URLs
         id: discover_rules
         run: |
           curl --silent --show-error --fail --location --retry 3 \
@@ -103,14 +104,19 @@ jobs:
 
           # The Python below is indented to match this run block. YAML strips
           # that shared indentation, so Python still sees top-level code.
-          pdf_url=$(python3 - <<'PY' || true
+          # It writes pdf_url, txt_url and filename_date to $GITHUB_OUTPUT.
+          if ! python3 - <<'PY'
+          import datetime
           import html
-          import re
+          import os
           import pathlib
-          from urllib.parse import quote, urljoin
+          import re
+          import sys
+          from urllib.parse import quote, unquote, urljoin
 
           page = pathlib.Path("rules.html").read_text(encoding="utf-8", errors="replace")
           base = "https://magic.wizards.com/en/rules"
+          comp_rules = re.compile(r"magiccomp|magic.*comp.*rules|comp.*rules", re.I)
 
           def clean(url):
               # Hrefs can contain HTML entities (&amp;) and raw spaces, which
@@ -119,40 +125,85 @@ jobs:
               url = urljoin(base, html.unescape(url).strip())
               return quote(url, safe=":/?#[]@!$&'()*+,;=%~")
 
-          matches = re.findall(r'''(?i)(?:href|src)=["']([^"']+?\.pdf(?:\?[^"']*)?)["']''', page)
-          candidates = [clean(m) for m in matches]
+          def links(ext):
+              pattern = rf'''(?i)(?:href|src)=["']([^"']+?\.{ext}(?:\?[^"']*)?)["']'''
+              # dict.fromkeys de-duplicates while keeping page order.
+              return list(dict.fromkeys(clean(m) for m in re.findall(pattern, page)))
 
-          for item in candidates:
-              if re.search(r"magiccomp|magic.*comp.*rules|comp.*rules", item, re.I):
-                  print(item)
-                  break
-          else:
-              if candidates:
-                  print(candidates[0])
+          def stem(url):
+              # "…/MagicCompRules%2020260925.pdf?x" -> "MagicCompRules 20260925"
+              name = unquote(url.split("?", 1)[0].rsplit("/", 1)[-1])
+              return name.rsplit(".", 1)[0]
+
+          def pick(candidates, prefer_stem=None):
+              if prefer_stem:
+                  for item in candidates:
+                      if stem(item) == prefer_stem:
+                          return item
+              for item in candidates:
+                  if comp_rules.search(item):
+                      return item
+              return candidates[0] if candidates else None
+
+          pdf_url = pick(links("pdf"))
+          if not pdf_url:
+              print("::error::Could not find a Magic Comp Rules PDF URL on the rules page")
+              sys.exit(1)
+
+          # Prefer the TXT with the same file name as the PDF, so the two
+          # assets are always the same edition.
+          txt_url = pick(links("txt"), prefer_stem=stem(pdf_url))
+          if not txt_url:
+              print("::error::Could not find a Magic Comp Rules TXT URL on the rules page")
+              sys.exit(1)
+          if stem(txt_url) != stem(pdf_url):
+              print(f"::warning::PDF and TXT file names differ ({stem(pdf_url)!r} vs {stem(txt_url)!r}); "
+                    "they may be different editions.")
+
+          # The file names carry a YYYYMMDD stamp (e.g. "MagicCompRules 20260925").
+          # Kept as a fallback in case the date can't be read from the TXT itself.
+          filename_date = ""
+          for s in (stem(pdf_url), stem(txt_url)):
+              m = re.search(r"(?<!\d)(20\d{2})(\d{2})(\d{2})(?!\d)", s)
+              if m:
+                  try:
+                      filename_date = datetime.date(*map(int, m.groups())).isoformat()
+                      break
+                  except ValueError:
+                      pass
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"pdf_url={pdf_url}\n")
+              out.write(f"txt_url={txt_url}\n")
+              out.write(f"filename_date={filename_date}\n")
+
+          print(f"Current Magic Comp Rules PDF: {pdf_url}")
+          print(f"Current Magic Comp Rules TXT: {txt_url}")
+          print(f"Date in file name: {filename_date or 'none found'}")
           PY
-          )
-
-          if [ -z "$pdf_url" ]; then
-            echo "::error::Could not find a Magic Comp Rules PDF URL on $RULES_PAGE_URL"
+          then
             echo "--- rules page preview ---"
             sed -n '1,160p' rules.html
             exit 1
           fi
 
-          echo "pdf_url=$pdf_url" >> "$GITHUB_OUTPUT"
-          echo "Current Magic Comp Rules PDF: $pdf_url"
-
-      - name: Skip if the published rules PDF is already this one
+      - name: Skip if the published rules files are already these ones
         id: check_rules
         env:
           PDF_URL: ${{ steps.discover_rules.outputs.pdf_url }}
+          TXT_URL: ${{ steps.discover_rules.outputs.txt_url }}
         run: |
-          previous=$(jq -r '.pdf_url // empty' "$RULES_META_FILE" 2>/dev/null || true)
-          if [ "$previous" = "$PDF_URL" ]; then
-            echo "Already published Magic Comp Rules PDF $PDF_URL - nothing to do."
+          prev_pdf=$(jq -r '.pdf_url // empty' "$RULES_META_FILE" 2>/dev/null || true)
+          prev_txt=$(jq -r '.txt_url // empty' "$RULES_META_FILE" 2>/dev/null || true)
+          # Metadata written before the TXT was tracked has no txt_url, so the
+          # first run after this change refreshes once and backfills it.
+          if [ "$prev_pdf" = "$PDF_URL" ] && [ "$prev_txt" = "$TXT_URL" ]; then
+            echo "Already published Magic Comp Rules $PDF_URL and $TXT_URL - nothing to do."
             echo "fresh=false" >> "$GITHUB_OUTPUT"
           else
-            echo "New Magic Comp Rules PDF: $PDF_URL (had: ${previous:-none})"
+            echo "New Magic Comp Rules:"
+            echo "  PDF: $PDF_URL (had: ${prev_pdf:-none})"
+            echo "  TXT: $TXT_URL (had: ${prev_txt:-none})"
             echo "fresh=true" >> "$GITHUB_OUTPUT"
           fi
 
@@ -214,6 +265,94 @@ jobs:
 
           echo "Verified $RULES_ASSET_NAME ($(du -h "$RULES_ASSET_NAME" | cut -f1))"
 
+      - name: Download and verify the Magic Comp Rules TXT, and read its edition date
+        id: fetch_rules_txt
+        if: steps.check_rules.outputs.fresh == 'true'
+        env:
+          TXT_URL: ${{ steps.discover_rules.outputs.txt_url }}
+          FILENAME_DATE: ${{ steps.discover_rules.outputs.filename_date }}
+        run: |
+          curl --silent --show-error --fail --location --retry 3 \
+            -H "User-Agent: $RULES_UA" \
+            -H "Accept: text/plain, */*" \
+            -o "$RULES_TXT_ASSET_NAME" \
+            "$TXT_URL"
+
+          test -s "$RULES_TXT_ASSET_NAME"
+
+          # The file is published as-is (BOM, CRLF line endings and all); the
+          # Python only reads it. It checks that it really is the rules text
+          # and pulls the "These rules are effective as of <date>." line.
+          python3 - <<'PY'
+          import datetime
+          import os
+          import pathlib
+          import re
+          import sys
+
+          path = pathlib.Path(os.environ["RULES_TXT_ASSET_NAME"])
+          raw = path.read_bytes()
+
+          # Wizards has shipped this file as UTF-8 (often with a BOM) and, in
+          # older editions, as Windows-1252; handle UTF-16 too, just in case.
+          if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+              text = raw.decode("utf-16")
+          else:
+              for encoding in ("utf-8-sig", "cp1252"):
+                  try:
+                      text = raw.decode(encoding)
+                      break
+                  except UnicodeDecodeError:
+                      continue
+              else:
+                  text = raw.decode("utf-8", errors="replace")
+
+          head = text[:5000]
+          if re.search(r"<!doctype|<html", head, re.I):
+              print("::error::Downloaded TXT looks like an HTML page, not the rules text")
+              sys.exit(1)
+          if "comprehensive rules" not in head.lower():
+              print("::error::Downloaded TXT does not look like the Comprehensive Rules:")
+              print(head[:800])
+              sys.exit(1)
+
+          filename_date = os.environ.get("FILENAME_DATE", "")
+          text_date = ""
+          normalized = head.replace("\u00a0", " ")
+          m = re.search(r"effective\s+as\s+of\s+([A-Za-z]+)\s+(\d{1,2}),?\s+(\d{4})", normalized, re.I)
+          if m:
+              month, day, year = m.groups()
+              try:
+                  text_date = datetime.datetime.strptime(
+                      f"{month.title()} {day} {year}", "%B %d %Y"
+                  ).date().isoformat()
+              except ValueError:
+                  print(f"::warning::Could not parse effective date {m.group(0)!r}")
+
+          if text_date:
+              edition_date, source = text_date, "txt"
+              if filename_date and filename_date != text_date:
+                  print(f"::notice::Effective date {text_date} differs from file-name date {filename_date}; "
+                        "using the effective date.")
+          elif filename_date:
+              edition_date, source = filename_date, "filename"
+              print(f"::warning::No 'effective as of' line found in the TXT; "
+                    f"using the file-name date {filename_date}.")
+          else:
+              print("::error::Could not determine the Comprehensive Rules edition date "
+                    "from the TXT or the file names.")
+              print(head[:800])
+              sys.exit(1)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"edition_date={edition_date}\n")
+              out.write(f"edition_date_source={source}\n")
+
+          print(f"Comprehensive Rules edition: {edition_date} (from {source})")
+          PY
+
+          echo "Verified $RULES_TXT_ASSET_NAME ($(du -h "$RULES_TXT_ASSET_NAME" | cut -f1))"
+
       - name: Write oracle metadata
         if: steps.check_oracle.outputs.fresh == 'true'
         env:
@@ -246,23 +385,46 @@ jobs:
         if: steps.check_rules.outputs.fresh == 'true'
         env:
           PDF_URL: ${{ steps.discover_rules.outputs.pdf_url }}
+          TXT_URL: ${{ steps.discover_rules.outputs.txt_url }}
+          FILENAME_DATE: ${{ steps.discover_rules.outputs.filename_date }}
+          EDITION_DATE: ${{ steps.fetch_rules_txt.outputs.edition_date }}
+          EDITION_DATE_SOURCE: ${{ steps.fetch_rules_txt.outputs.edition_date_source }}
         run: |
+          release_base="https://github.com/$GITHUB_REPOSITORY/releases/download/$RULES_RELEASE_TAG"
+          # The PDF keys keep their original names so existing readers of this
+          # file keep working; the TXT gets txt_-prefixed equivalents.
           jq -n \
-            --arg pdf_url "$PDF_URL" \
+            --arg edition_date "$EDITION_DATE" \
+            --arg edition_date_source "$EDITION_DATE_SOURCE" \
+            --arg filename_date "$FILENAME_DATE" \
             --arg source_page "$RULES_PAGE_URL" \
             --arg fetched_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg pdf_url "$PDF_URL" \
             --arg asset "$RULES_ASSET_NAME" \
             --argjson bytes "$(stat -c %s "$RULES_ASSET_NAME")" \
-            --arg url "https://github.com/$GITHUB_REPOSITORY/releases/download/$RULES_RELEASE_TAG/$RULES_ASSET_NAME" \
+            --arg url "$release_base/$RULES_ASSET_NAME" \
             --arg sha256 "$(sha256sum "$RULES_ASSET_NAME" | cut -d ' ' -f 1)" \
+            --arg txt_url "$TXT_URL" \
+            --arg txt_asset "$RULES_TXT_ASSET_NAME" \
+            --argjson txt_bytes "$(stat -c %s "$RULES_TXT_ASSET_NAME")" \
+            --arg txt_download_url "$release_base/$RULES_TXT_ASSET_NAME" \
+            --arg txt_sha256 "$(sha256sum "$RULES_TXT_ASSET_NAME" | cut -d ' ' -f 1)" \
             '{
-              pdf_url: $pdf_url,
+              edition_date: $edition_date,
+              edition_date_source: $edition_date_source,
+              filename_date: (if $filename_date == "" then null else $filename_date end),
               source_page: $source_page,
               fetched_at: $fetched_at,
+              pdf_url: $pdf_url,
               asset: $asset,
               bytes: $bytes,
               download_url: $url,
-              sha256: $sha256
+              sha256: $sha256,
+              txt_url: $txt_url,
+              txt_asset: $txt_asset,
+              txt_bytes: $txt_bytes,
+              txt_download_url: $txt_download_url,
+              txt_sha256: $txt_sha256
             }' > "$RULES_META_FILE"
           cat "$RULES_META_FILE"
 
@@ -282,26 +444,29 @@ jobs:
           fi
           gh release upload "$ORACLE_RELEASE_TAG" "$ORACLE_ASSET_NAME" "$ORACLE_META_FILE" --clobber
 
-      - name: Publish refreshed rules PDF assets
+      - name: Publish refreshed rules assets
         if: steps.check_rules.outputs.fresh == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           PDF_URL: ${{ steps.discover_rules.outputs.pdf_url }}
+          TXT_URL: ${{ steps.discover_rules.outputs.txt_url }}
+          EDITION_DATE: ${{ steps.fetch_rules_txt.outputs.edition_date }}
         run: |
-          notes="Latest Magic Comprehensive Rules PDF from $RULES_PAGE_URL. Source URL: $PDF_URL. Checksum and details in $RULES_META_FILE."
+          notes="Magic Comprehensive Rules effective $EDITION_DATE, as PDF and TXT, from $RULES_PAGE_URL. Sources: $PDF_URL and $TXT_URL. Checksums and details in $RULES_META_FILE."
           if gh release view "$RULES_RELEASE_TAG" > /dev/null 2>&1; then
             gh release edit "$RULES_RELEASE_TAG" --notes "$notes"
           else
             gh release create "$RULES_RELEASE_TAG" --title "Magic Comprehensive Rules (rolling)" --notes "$notes"
           fi
-          gh release upload "$RULES_RELEASE_TAG" "$RULES_ASSET_NAME" "$RULES_META_FILE" --clobber
+          gh release upload "$RULES_RELEASE_TAG" \
+            "$RULES_ASSET_NAME" "$RULES_TXT_ASSET_NAME" "$RULES_META_FILE" --clobber
 
       - name: Commit the metadata
         if: steps.check_oracle.outputs.fresh == 'true' || steps.check_rules.outputs.fresh == 'true'
         env:
           UPDATED_AT: ${{ steps.index.outputs.updated_at }}
-          PDF_URL: ${{ steps.discover_rules.outputs.pdf_url }}
+          EDITION_DATE: ${{ steps.fetch_rules_txt.outputs.edition_date }}
           ORACLE_FRESH: ${{ steps.check_oracle.outputs.fresh }}
           RULES_FRESH: ${{ steps.check_rules.outputs.fresh }}
         run: |
@@ -324,11 +489,11 @@ jobs:
           fi
 
           if [ "$ORACLE_FRESH" = "true" ] && [ "$RULES_FRESH" = "true" ]; then
-            git commit -m "oracle cards + rules: Scryfall build $UPDATED_AT and latest Magic Comp Rules PDF"
+            git commit -m "oracle cards + rules: Scryfall build $UPDATED_AT and Comp Rules effective $EDITION_DATE"
           elif [ "$ORACLE_FRESH" = "true" ]; then
             git commit -m "oracle cards: Scryfall build $UPDATED_AT"
           else
-            git commit -m "rules: latest Magic Comp Rules PDF ($PDF_URL)"
+            git commit -m "rules: Comp Rules effective $EDITION_DATE (PDF + TXT)"
           fi
 
           # Rebase and retry if the branch moved while this job was running.
