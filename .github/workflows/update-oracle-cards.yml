@@ -1,4 +1,4 @@
-name: Update Scryfall oracle cards
+name: Update Scryfall oracle cards and Magic Comp Rules
 
 on:
   schedule:
@@ -9,26 +9,31 @@ on:
     - cron: "37 12 * * *"
   workflow_dispatch: # also lets you run it by hand from the Actions tab
 
-# The job needs to push a commit and upload a release asset.
+# The job needs to push a commit and upload release assets.
 permissions:
   contents: write
 
 # Never let a manual run and a scheduled run push at the same time.
 concurrency:
-  group: refresh-oracle-cards
+  group: refresh-data
   cancel-in-progress: false
 
 env:
-  RELEASE_TAG: oracle-cards
-  ASSET_NAME: oracle-cards.jsonl.gz
-  META_FILE: oracle-cards.meta.json
+  ORACLE_RELEASE_TAG: oracle-cards
+  ORACLE_ASSET_NAME: oracle-cards.jsonl.gz
+  ORACLE_META_FILE: oracle-cards.meta.json
+  RULES_RELEASE_TAG: magic-comp-rules
+  RULES_ASSET_NAME: magic-comp-rules.pdf
+  RULES_META_FILE: magic-comp-rules.meta.json
+  RULES_PAGE_URL: https://magic.wizards.com/en/rules
   # Scryfall rejects API requests that don't identify themselves.
   SCRYFALL_UA: "github.com/${{ github.repository }} (oracle-cards refresh workflow)"
+  RULES_UA: "github.com/${{ github.repository }} (magic-comp-rules refresh workflow)"
 
 jobs:
   refresh:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     defaults:
       run:
         shell: bash # explicit "bash" gives -e and -o pipefail, so a failing pipe fails the step
@@ -50,29 +55,36 @@ jobs:
             exit 1
           fi
 
-          # Since mid-2026 Scryfall's bulk files are gzipped JSONL and the entry
-          # carries jsonl_download_uri; the old download_uri (one big JSON array)
-          # no longer exists.
           updated_at=$(jq -r '.updated_at // empty' entry.json)
+          # Prefer a JSONL download if Scryfall offers one; otherwise fall back
+          # to the standard JSON-array download and convert it later.
           jsonl_uri=$(jq -r '.jsonl_download_uri // empty' entry.json)
-          if [ -z "$updated_at" ] || [ -z "$jsonl_uri" ]; then
-            echo "::error::oracle_cards entry is missing updated_at or jsonl_download_uri. Entry was:"
+          json_uri=$(jq -r '.download_uri // empty' entry.json)
+          if [ -n "$jsonl_uri" ]; then
+            uri="$jsonl_uri"; format=jsonl
+          else
+            uri="$json_uri"; format=json
+          fi
+
+          if [ -z "$updated_at" ] || [ -z "$uri" ]; then
+            echo "::error::oracle_cards entry is missing updated_at or a download URI. Entry was:"
             cat entry.json
             exit 1
           fi
 
           {
             echo "updated_at=$updated_at"
-            echo "jsonl_uri=$jsonl_uri"
+            echo "download_uri=$uri"
+            echo "format=$format"
           } >> "$GITHUB_OUTPUT"
-          echo "Current Scryfall build: $updated_at -> $jsonl_uri"
+          echo "Current Scryfall build: $updated_at -> $uri ($format)"
 
-      - name: Skip if the published build is already this one
-        id: check
+      - name: Skip if the published Scryfall build is already this one
+        id: check_oracle
         env:
           UPDATED_AT: ${{ steps.index.outputs.updated_at }}
         run: |
-          previous=$(jq -r '.scryfall_updated_at // empty' "$META_FILE" 2>/dev/null || true)
+          previous=$(jq -r '.scryfall_updated_at // empty' "$ORACLE_META_FILE" 2>/dev/null || true)
           if [ "$previous" = "$UPDATED_AT" ]; then
             echo "Already published Scryfall build $UPDATED_AT - nothing to do."
             echo "fresh=false" >> "$GITHUB_OUTPUT"
@@ -81,56 +93,135 @@ jobs:
             echo "fresh=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Download and verify
-        id: fetch
-        if: steps.check.outputs.fresh == 'true'
-        env:
-          JSONL_URI: ${{ steps.index.outputs.jsonl_uri }}
+      - name: Discover the current Magic Comp Rules PDF URL
+        id: discover_rules
         run: |
-          # No --compressed here: the file itself is a gzip archive and we want
-          # it on disk exactly as Scryfall serves it.
+          curl --silent --show-error --fail --location --retry 3 \
+            -H "User-Agent: $RULES_UA" \
+            -H "Accept: text/html,application/xhtml+xml" \
+            "$RULES_PAGE_URL" > rules.html
+
+          # The Python below is indented to match this run block. YAML strips
+          # that shared indentation, so Python still sees top-level code.
+          pdf_url=$(python3 - <<'PY' || true
+          import re
+          import pathlib
+          from urllib.parse import urljoin
+
+          page = pathlib.Path("rules.html").read_text(encoding="utf-8", errors="replace")
+          base = "https://magic.wizards.com/en/rules"
+
+          matches = re.findall(r'''(?i)(?:href|src)=["']([^"']+?\.pdf(?:\?[^"']*)?)["']''', page)
+          candidates = [urljoin(base, m) for m in matches]
+
+          for item in candidates:
+              if re.search(r"magiccomp|magic.*comp.*rules|comp.*rules", item, re.I):
+                  print(item)
+                  break
+          else:
+              if candidates:
+                  print(candidates[0])
+          PY
+          )
+
+          if [ -z "$pdf_url" ]; then
+            echo "::error::Could not find a Magic Comp Rules PDF URL on $RULES_PAGE_URL"
+            echo "--- rules page preview ---"
+            sed -n '1,160p' rules.html
+            exit 1
+          fi
+
+          echo "pdf_url=$pdf_url" >> "$GITHUB_OUTPUT"
+          echo "Current Magic Comp Rules PDF: $pdf_url"
+
+      - name: Skip if the published rules PDF is already this one
+        id: check_rules
+        env:
+          PDF_URL: ${{ steps.discover_rules.outputs.pdf_url }}
+        run: |
+          previous=$(jq -r '.pdf_url // empty' "$RULES_META_FILE" 2>/dev/null || true)
+          if [ "$previous" = "$PDF_URL" ]; then
+            echo "Already published Magic Comp Rules PDF $PDF_URL - nothing to do."
+            echo "fresh=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "New Magic Comp Rules PDF: $PDF_URL (had: ${previous:-none})"
+            echo "fresh=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download and verify the oracle card data
+        id: fetch_oracle
+        if: steps.check_oracle.outputs.fresh == 'true'
+        env:
+          DOWNLOAD_URI: ${{ steps.index.outputs.download_uri }}
+          FORMAT: ${{ steps.index.outputs.format }}
+        run: |
           curl --silent --show-error --fail --location --retry 3 \
             -H "User-Agent: $SCRYFALL_UA" \
             -H "Accept: */*" \
             -o download.bin \
-            "$JSONL_URI"
+            "$DOWNLOAD_URI"
 
+          # Undo gzip if the payload arrived compressed.
           if gzip -t download.bin 2>/dev/null; then
-            mv download.bin "$ASSET_NAME"
+            gzip -dc download.bin > download.raw
           else
-            # A CDN that decodes gzip on the way out would hand us plain JSONL;
-            # compress it ourselves rather than publish a non-archive.
-            gzip -9 -n -c download.bin > "$ASSET_NAME"
+            mv download.bin download.raw
           fi
 
-          # Sanity checks before anything is published: it must be a long list
-          # of card objects, not an error page or a truncated file. Decompressed
-          # to disk rather than piped, because a pipe that head closes early
-          # would fail the step under pipefail.
-          gzip -dc "$ASSET_NAME" > oracle-cards.jsonl
+          # Normalize to one card object per line.
+          if [ "$FORMAT" = "json" ]; then
+            jq -c '.[]' download.raw > oracle-cards.jsonl
+          else
+            mv download.raw oracle-cards.jsonl
+          fi
+
           count=$(wc -l < oracle-cards.jsonl)
           head -n 1 oracle-cards.jsonl | jq -e '.object == "card"' > /dev/null
           test "$count" -ge 10000
 
-          echo "count=$count" >> "$GITHUB_OUTPUT"
-          echo "Verified $count cards in $ASSET_NAME ($(du -h "$ASSET_NAME" | cut -f1))"
+          gzip -9 -n -c oracle-cards.jsonl > "$ORACLE_ASSET_NAME"
 
-      - name: Write metadata
-        if: steps.check.outputs.fresh == 'true'
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "Verified $count cards in $ORACLE_ASSET_NAME ($(du -h "$ORACLE_ASSET_NAME" | cut -f1))"
+
+      - name: Download and verify the Magic Comp Rules PDF
+        id: fetch_rules
+        if: steps.check_rules.outputs.fresh == 'true'
+        env:
+          PDF_URL: ${{ steps.discover_rules.outputs.pdf_url }}
+        run: |
+          curl --silent --show-error --fail --location --retry 3 \
+            -H "User-Agent: $RULES_UA" \
+            -H "Accept: application/pdf, */*" \
+            -o "$RULES_ASSET_NAME" \
+            "$PDF_URL"
+
+          test -s "$RULES_ASSET_NAME"
+          # Every PDF starts with the "%PDF-" magic bytes; no poppler needed.
+          if [ "$(head -c 5 "$RULES_ASSET_NAME")" != "%PDF-" ]; then
+            echo "::error::Downloaded file is not a PDF:"
+            file "$RULES_ASSET_NAME" || true
+            exit 1
+          fi
+
+          echo "Verified $RULES_ASSET_NAME ($(du -h "$RULES_ASSET_NAME" | cut -f1))"
+
+      - name: Write oracle metadata
+        if: steps.check_oracle.outputs.fresh == 'true'
         env:
           UPDATED_AT: ${{ steps.index.outputs.updated_at }}
-          JSONL_URI: ${{ steps.index.outputs.jsonl_uri }}
-          COUNT: ${{ steps.fetch.outputs.count }}
+          DOWNLOAD_URI: ${{ steps.index.outputs.download_uri }}
+          COUNT: ${{ steps.fetch_oracle.outputs.count }}
         run: |
           jq -n \
             --arg updated_at "$UPDATED_AT" \
-            --arg source "$JSONL_URI" \
+            --arg source "$DOWNLOAD_URI" \
             --arg fetched_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             --argjson count "$COUNT" \
-            --arg asset "$ASSET_NAME" \
-            --argjson bytes "$(stat -c %s "$ASSET_NAME")" \
-            --arg url "https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/$ASSET_NAME" \
-            --arg sha256 "$(sha256sum "$ASSET_NAME" | cut -d ' ' -f 1)" \
+            --arg asset "$ORACLE_ASSET_NAME" \
+            --argjson bytes "$(stat -c %s "$ORACLE_ASSET_NAME")" \
+            --arg url "https://github.com/$GITHUB_REPOSITORY/releases/download/$ORACLE_RELEASE_TAG/$ORACLE_ASSET_NAME" \
+            --arg sha256 "$(sha256sum "$ORACLE_ASSET_NAME" | cut -d ' ' -f 1)" \
             '{
               scryfall_updated_at: $updated_at,
               scryfall_source: $source,
@@ -140,37 +231,105 @@ jobs:
               bytes: $bytes,
               download_url: $url,
               sha256: $sha256
-            }' > "$META_FILE"
-          cat "$META_FILE"
+            }' > "$ORACLE_META_FILE"
+          cat "$ORACLE_META_FILE"
 
-      - name: Publish to the rolling release
-        if: steps.check.outputs.fresh == 'true'
+      - name: Write rules metadata
+        if: steps.check_rules.outputs.fresh == 'true'
+        env:
+          PDF_URL: ${{ steps.discover_rules.outputs.pdf_url }}
+        run: |
+          jq -n \
+            --arg pdf_url "$PDF_URL" \
+            --arg source_page "$RULES_PAGE_URL" \
+            --arg fetched_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg asset "$RULES_ASSET_NAME" \
+            --argjson bytes "$(stat -c %s "$RULES_ASSET_NAME")" \
+            --arg url "https://github.com/$GITHUB_REPOSITORY/releases/download/$RULES_RELEASE_TAG/$RULES_ASSET_NAME" \
+            --arg sha256 "$(sha256sum "$RULES_ASSET_NAME" | cut -d ' ' -f 1)" \
+            '{
+              pdf_url: $pdf_url,
+              source_page: $source_page,
+              fetched_at: $fetched_at,
+              asset: $asset,
+              bytes: $bytes,
+              download_url: $url,
+              sha256: $sha256
+            }' > "$RULES_META_FILE"
+          cat "$RULES_META_FILE"
+
+      - name: Publish refreshed oracle assets
+        if: steps.check_oracle.outputs.fresh == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           UPDATED_AT: ${{ steps.index.outputs.updated_at }}
-          COUNT: ${{ steps.fetch.outputs.count }}
+          COUNT: ${{ steps.fetch_oracle.outputs.count }}
         run: |
-          notes="Scryfall oracle_cards build $UPDATED_AT, $COUNT cards, gzipped JSONL (one card object per line) as served by Scryfall. Checksum and details in $META_FILE."
-          if gh release view "$RELEASE_TAG" > /dev/null 2>&1; then
-            gh release edit "$RELEASE_TAG" --notes "$notes"
+          notes="Scryfall oracle_cards build $UPDATED_AT, $COUNT cards, gzipped JSONL (one card object per line). Checksum and details in $ORACLE_META_FILE."
+          if gh release view "$ORACLE_RELEASE_TAG" > /dev/null 2>&1; then
+            gh release edit "$ORACLE_RELEASE_TAG" --notes "$notes"
           else
-            gh release create "$RELEASE_TAG" --title "Scryfall oracle cards (rolling)" --notes "$notes"
+            gh release create "$ORACLE_RELEASE_TAG" --title "Scryfall oracle cards (rolling)" --notes "$notes"
           fi
-          # --clobber replaces the existing assets of the same names, so the
-          # download URLs never change.
-          gh release upload "$RELEASE_TAG" "$ASSET_NAME" "$META_FILE" --clobber
+          gh release upload "$ORACLE_RELEASE_TAG" "$ORACLE_ASSET_NAME" "$ORACLE_META_FILE" --clobber
+
+      - name: Publish refreshed rules PDF assets
+        if: steps.check_rules.outputs.fresh == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PDF_URL: ${{ steps.discover_rules.outputs.pdf_url }}
+        run: |
+          notes="Latest Magic Comprehensive Rules PDF from $RULES_PAGE_URL. Source URL: $PDF_URL. Checksum and details in $RULES_META_FILE."
+          if gh release view "$RULES_RELEASE_TAG" > /dev/null 2>&1; then
+            gh release edit "$RULES_RELEASE_TAG" --notes "$notes"
+          else
+            gh release create "$RULES_RELEASE_TAG" --title "Magic Comprehensive Rules (rolling)" --notes "$notes"
+          fi
+          gh release upload "$RULES_RELEASE_TAG" "$RULES_ASSET_NAME" "$RULES_META_FILE" --clobber
 
       - name: Commit the metadata
-        if: steps.check.outputs.fresh == 'true'
+        if: steps.check_oracle.outputs.fresh == 'true' || steps.check_rules.outputs.fresh == 'true'
         env:
           UPDATED_AT: ${{ steps.index.outputs.updated_at }}
+          PDF_URL: ${{ steps.discover_rules.outputs.pdf_url }}
+          ORACLE_FRESH: ${{ steps.check_oracle.outputs.fresh }}
+          RULES_FRESH: ${{ steps.check_rules.outputs.fresh }}
         run: |
-          # Besides giving the repo a visible history of data builds, this tiny
-          # daily commit counts as repository activity, which stops GitHub from
-          # auto-disabling the schedule after 60 days of inactivity.
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add "$META_FILE"
-          git commit -m "oracle cards: Scryfall build $UPDATED_AT"
-          git push
+
+          files=()
+          [ -f "$ORACLE_META_FILE" ] && files+=("$ORACLE_META_FILE")
+          [ -f "$RULES_META_FILE" ] && files+=("$RULES_META_FILE")
+
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "No metadata files updated; nothing to commit."
+            exit 0
+          fi
+
+          git add "${files[@]}"
+          if git diff --cached --quiet; then
+            echo "No metadata changes to commit."
+            exit 0
+          fi
+
+          if [ "$ORACLE_FRESH" = "true" ] && [ "$RULES_FRESH" = "true" ]; then
+            git commit -m "oracle cards + rules: Scryfall build $UPDATED_AT and latest Magic Comp Rules PDF"
+          elif [ "$ORACLE_FRESH" = "true" ]; then
+            git commit -m "oracle cards: Scryfall build $UPDATED_AT"
+          else
+            git commit -m "rules: latest Magic Comp Rules PDF ($PDF_URL)"
+          fi
+
+          # Rebase and retry if the branch moved while this job was running.
+          for attempt in 1 2 3; do
+            if git push; then
+              exit 0
+            fi
+            echo "Push failed (attempt $attempt); rebasing and retrying..."
+            git pull --rebase
+          done
+          echo "::error::Could not push metadata after 3 attempts."
+          exit 1
