@@ -1,10 +1,10 @@
 {
-  "scryfall_updated_at": "2026-10-20T09:01:59.775+00:00",
-  "scryfall_source": "https://data.scryfall.io/oracle-cards/oracle-cards-20261020090159.jsonl.gz",
-  "fetched_at": "2026-10-20T17:29:40Z",
-  "card_count": 38861,
+  "scryfall_updated_at": "2026-10-20T21:02:00.122+00:00",
+  "scryfall_source": "https://data.scryfall.io/oracle-cards/oracle-cards-20261020210200.jsonl.gz",
+  "fetched_at": "2026-10-20T23:03:06Z",
+  "card_count": 38940,
   "asset": "oracle-cards.jsonl.gz",
-  "bytes": 25020635,
+  "bytes": 25247956,
   "download_url": "https://github.com/ZackGregory/oracle/releases/download/oracle-cards/oracle-cards.jsonl.gz",
-  "sha256": "059a0c7e4976839c9605b3b5b28d112654f7aa80c1474502d4e34dcdd60f62fb"
+  "sha256": "629b28ade8a0254dd110c35fb0f673f13aae1a1e3cda84b7401a829157e4800b"
 }
