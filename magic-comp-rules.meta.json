@@ -1,17 +1,17 @@
 {
-  "edition_date": "2026-09-25",
+  "edition_date": "2026-11-06",
   "edition_date_source": "txt",
-  "filename_date": "2026-09-25",
+  "filename_date": "2026-11-06",
   "source_page": "https://magic.wizards.com/en/rules",
-  "fetched_at": "2026-10-20T23:13:00Z",
-  "pdf_url": "https://media.wizards.com/2026/downloads/MagicCompRules%2020260925.pdf",
+  "fetched_at": "2026-11-06T19:39:55Z",
+  "pdf_url": "https://media.wizards.com/2026/downloads/MagicCompRules%2020261106.pdf",
   "asset": "magic-comp-rules.pdf",
-  "bytes": 2527259,
+  "bytes": 2417910,
   "download_url": "https://github.com/ZackGregory/oracle/releases/download/magic-comp-rules/magic-comp-rules.pdf",
-  "sha256": "674241213075cd581dd3255567ebeec7b40ffae3a27c6a3bd99218af6b2b6659",
-  "txt_url": "https://media.wizards.com/2026/downloads/MagicCompRules%2020260925.txt",
+  "sha256": "1429daccbe12bd7d41958a487bca2e147d5f8c7d977630be7065d49d5eb9d26b",
+  "txt_url": "https://media.wizards.com/2026/downloads/MagicCompRules%2020261106.txt",
   "txt_asset": "magic-comp-rules.txt",
-  "txt_bytes": 977752,
+  "txt_bytes": 985613,
   "txt_download_url": "https://github.com/ZackGregory/oracle/releases/download/magic-comp-rules/magic-comp-rules.txt",
-  "txt_sha256": "8d860e451f20f38865b725b42d82feb714c725373dd8f3b32b8652b3eeb070ca"
+  "txt_sha256": "524f5195a1e5f54bb13c735edf399ac717a4458e2713f398d1a3e6877186b829"
 }
